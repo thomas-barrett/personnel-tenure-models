@@ -1,0 +1,85 @@
+# Snapshot collector. Runs in GitHub's cloud regardless of the laptop's state.
+#
+# Hourly job: series metadata + open-market quotes (~1 minute).
+# Daily job (04:20 UTC): everything plus settled/historical markets, candlesticks
+# for open and recently-settled markets, and catalogue discovery (~5 minutes).
+#
+# Raw captures are committed to the orphan branch `data` (never to `main`), so
+# your own work on `main` never conflicts with the collector's commits.
+# The job fails loudly (red X + email from GitHub) if any registry series fails.
+
+name: collect
+
+on:
+  schedule:
+    - cron: "7 * * * *"      # hourly at :07 (avoid the top-of-hour crowd)
+    - cron: "20 4 * * *"     # daily at 04:20 UTC
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "hourly or daily"
+        default: "daily"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect-data-branch
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out code (main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: code
+
+      - name: Check out data branch (create if missing)
+        run: |
+          set -e
+          git clone --depth 1 --branch data "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data \
+          || { mkdir data && cd data && git init -b data && git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"; }
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.4.x"
+
+      - name: Install project (locked)
+        working-directory: code
+        run: uv sync --frozen --no-dev
+
+      - name: Decide mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "20 4 * * *" ]; then
+            echo "mode=daily" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=hourly" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run collector
+        working-directory: code
+        run: uv run ptm-collect --mode "${{ steps.mode.outputs.mode }}" --root ../data/raw --candle-days 3
+
+      - name: Commit and push captures (retry on race)
+        working-directory: data
+        run: |
+          set -e
+          git config user.name "ptm-collector"
+          git config user.email "ptm-collector@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
+          git commit -q -m "capture ${{ steps.mode.outputs.mode }} $(date -u +%Y-%m-%dT%H:%M:%SZ) run=${{ github.run_id }}"
+          for i in 1 2 3 4 5; do
+            if git push origin data; then exit 0; fi
+            echo "push failed; fetching and rebasing (attempt $i)"
+            git fetch origin data && git rebase origin/data || { git rebase --abort; sleep 10; }
+          done
+          echo "could not push after 5 attempts" >&2; exit 1

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Raw captures live on the `data` branch, never on main.
+data/raw/**
+!data/raw/.gitkeep
+data/derived/**
+!data/derived/.gitkeep
+
+# Local scratch
+scratch/
+*.log
